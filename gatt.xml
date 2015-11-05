@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<configuration>
+
+    <!-- 1800: org.bluetooth.service.generic_access -->
+    <service uuid="1800" id="generic_access">
+        <description>Generic Access</description>
+
+        <!-- 2A00: org.bluetooth.characteristic.gap.device_name -->
+        <characteristic uuid="2A00" id="c_device_name">
+            <description>Device Name</description>
+            <properties read="true" />
+            <value>Multislave Slave</value>
+        </characteristic>
+
+        <!-- 2A01: org.bluetooth.characteristic.gap.appearance -->
+        <characteristic uuid="2A01" id="c_appearance">
+            <description>Appearance</description>
+            <properties read="true" const="true" />
+            <value type="hex">0200</value> <!-- 0200: Generic Tag -->
+        </characteristic>
+    </service>
+	
+	<!-- 1804: org.bluetooth.service.tx_power -->
+    <service uuid="1804" id="generic_access">
+        <description>Tx Power</description>
+        <!-- 2A07: org.bluetooth.characteristic.tx_power_level -->
+        <characteristic uuid="2A07" id="c_device_name">
+            <description>Current transmit power level</description>
+            <properties read="true" const="true" />
+            <value type="hex">08</value>
+        </characteristic>
+    </service>
+
+    <!-- 180A: org.bluetooth.service.device_information -->
+    <service uuid="180A" id="device_information">
+        <description>Device Information</description>
+    
+        <!-- 2A29: org.bluetooth.characteristic.manufacturer_name_string -->
+        <characteristic uuid="2A29" id="c_manufacturer_name">
+            <description>Manufacturer Name</description>
+            <properties read="true" const="true" />
+            <value>MAVLab TUDelft</value>
+        </characteristic>
+
+        <!-- 2A24: org.bluetooth.characteristic.model_number_string -->
+        <characteristic uuid="2A24" id="c_model_number">
+            <description>Model Number</description>
+            <properties read="true" const="true" />
+            <value>Elpasys v1.0</value>
+        </characteristic>
+        
+    </service>
+
+	<!-- e7add780-b042-4876-aae1-112855353cc1-->
+    <!-- custom service -->
+    <service uuid="0bd51666-e7cb-469b-8e4d-2742f1ba77cc">
+        <description>Telemetry service</description>        
+        <characteristic uuid="fa87c0d0-afac-11de-8a39-0800200c9a66" id="xgatt_data">
+            <description>Data</description>
+            <properties read="true" write="true" write_no_response="true" indicate="true" notify="true"  />
+            <value variable_length="true" length="20"/>
+        </characteristic>
+		
+		<description>Status and Control Service</description>
+        <!-- custom characteristic for controlling rssi broadcast -->
+        <characteristic uuid="6fba5c80-5876-4815-9167-26d19aaa25ec" id="c_rssi_broadcast">
+            <description>RSSI Broadcast Control Point</description>
+            <properties read="true" write="true" />
+            <value type="hex">00</value>
+        </characteristic>
+    </service>
+	
+	 <!-- custom service -->
+    <!--  <service uuid="25af9d04-4b85-4f58-97e1-845bd4dd5e38" advertise="true">
+        
+    </service> -->
+
+</configuration>

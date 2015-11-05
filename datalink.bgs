@@ -1,0 +1,462 @@
+# ================================================================
+# BGScript demo: Drone-Drone proximity sensor and telemetry
+# Drone side
+# 
+# ----------------------------------------------------------------
+#
+#
+# ================================================================
+
+# lisa message codes
+#	0xff: Communication lost with ground station
+#	0xfe: RSSI value
+#	0xfd: Interrupt handled
+#	0xfc: All stored RSSI
+#	less than 20: Message from connection master
+
+# ================================================================
+# timer clock: 1s is 32768 ticks
+
+# ADVertizement data
+dim adv_data(31)
+dim sr_data(20) # custom scan response data (friendly name for active scanning)
+dim my_mac_addr(6) # Bluetooth MAC address container
+
+dim MAC_ADDR(4)
+
+# STDMA variables
+const NUM_STDMA_SLOTS = 8
+dim stdma_slots(NUM_STDMA_SLOTS)
+dim my_slot
+
+dim senders(NUM_STDMA_SLOTS*2)	# store last 2 bytes of mac addresses
+dim k_senders
+dim sig_strength(NUM_STDMA_SLOTS)
+
+const RSSI_CLOCK = 740	# rssi clock 44Hz
+dim broadcast_mode
+
+# spi variables
+dim in_buf(31)
+dim in_buf_loc
+dim in_buf_size
+
+const SPI_DATA_LEN = 20
+dim spi_data(SPI_DATA_LEN)
+const SPI_CLOCK = 164		# spi clock 200Hz
+
+# counters
+dim counter
+dim i
+dim j
+dim k
+
+# misc elements
+dim tlen
+dim channel
+dim result
+dim connected
+dim encrypted
+
+# import "rand.bgs"
+
+# ================================================================
+
+event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
+  # initialize status
+  connected = 0
+  encrypted = 0
+
+	memset(senders(0), 0, 16)
+	memset(sig_strength(0), 0, 8)
+	k_senders = 0
+	counter = 0
+	broadcast_mode = 0
+	
+	memset(in_buf(0),0,31)
+	in_buf_loc = 0
+	in_buf_size = 0
+	
+	memset(spi_data(0),0,20)
+
+	MAC_ADDR(0) = $0007802d							# beginning of the macaddress of Bluegiga modules
+	
+	call hardware_io_port_config_direction(0, $10)	# Configure slave select as output
+	call hardware_io_port_write(0, $10, $10)		# Disable slave select
+
+	# Initialize ADV data
+	# Flags = LE General Discovery, single mode device (02 01 06) flags for discoverable/connectible
+	adv_data(0:1) = $02 							# ad field length = 2 bytes
+	adv_data(1:1) = gap_ad_type_flags 				# ad field type = 0x01 (Flags)
+	adv_data(2:1) = $06 							# flags = 0x06, bit 1 General discoverable, bit 2 BR/EDR not supported
+	# tx power field advertisement, Note: when the TX Power Level tag is not present, the TX power level of the packet is unknown.
+	adv_data(3:1) = $02 							# ad field length = 2 bytes
+	adv_data(4:1) = gap_ad_type_txpower 			# ad field type = 0x0A (TX Power)
+	adv_data(5:1) = $08 							# TX power in dBm, can get tx power from system call
+
+	# custom manufacturer
+	adv_data(6:1) = $12 							# ad field length, minimum 3
+	adv_data(7:1) = $ff 							# ad field type = 0xFF (Manufacturer Specific Data)
+	adv_data(8:1) = $ff 							# unknown/prototype Company Identifier Code - octet 2
+	adv_data(9:1) = $ff 							# unknown/prototype Company Identifier Code - octet 1
+	
+	adv_data(10:1) = $b1 							# Following contains GPS message
+	adv_data(11:1) = $b2 							# 
+	adv_data(12:1) = $b3 							# 
+	adv_data(13:1) = $b3 							# 
+	adv_data(14:1) = $b3 							# 
+	adv_data(15:1) = $b3 							# 
+	adv_data(16:1) = $b3 							# 
+	adv_data(17:1) = $b3 							# 
+	adv_data(18:1) = $b3 							# 
+	adv_data(19:1) = $b3 							# 
+	adv_data(20:1) = $b3 							# 
+	adv_data(21:1) = $b3 							# 
+	adv_data(22:1) = $b3 							# 
+	adv_data(23:1) = $b3 							# 
+	adv_data(24:1) = $b3 							# 
+	
+	# build custom scan response data
+	# get Bluetooth MAC address of this device (NOTE: this is little-endian!)
+	call system_address_get()(my_mac_addr(0:6))
+	sr_data(0:1) = $13 								# ad field length = 19 bytes (0x13)
+	sr_data(1:1) = gap_ad_type_localname_complete 	# ad field type = 0x09 (Complete local name)
+	sr_data(2:1) = $4c 		# 'L'
+	sr_data(3:1) = $61 		# 'a'
+	sr_data(4:1) = $64 		# 'd'
+	sr_data(5:1) = $79 		# 'y'
+	sr_data(6:1) = $20 		# ' '
+	sr_data(7:1) = $4c 		# 'L'
+	sr_data(8:1) = $69 		# 'i'
+	sr_data(9:1) = $73 		# 's'
+	sr_data(10:1) = $61 	# 'a'
+	sr_data(11:1) = $20 	# ' '
+	sr_data(12:1) = (my_mac_addr(2:1)/$10) + 48 + ((my_mac_addr(2:1)/$10)/10*7) # MAC byte 4 10's digit
+	sr_data(13:1) = (my_mac_addr(2:1)&$f) + 48 + ((my_mac_addr(2:1)&$f )/10*7) 	# MAC byte 4 1's digit
+	sr_data(14:1) = $3a # ':'
+	sr_data(15:1) = (my_mac_addr(1:1)/$10) + 48 + ((my_mac_addr(1:1)/$10)/10*7) # MAC byte 5 10's digit
+	sr_data(16:1) = (my_mac_addr(1:1)&$f) + 48 + ((my_mac_addr(1:1)&$f )/10*7) 	# MAC byte 5 1's digit
+	sr_data(17:1) = $3a # ':'
+	sr_data(18:1) = (my_mac_addr(0:1)/$10) + 48 + ((my_mac_addr(0:1)/$10)/10*7) # MAC byte 6 10's digit
+	sr_data(19:1) = (my_mac_addr(0:1)&$f) + 48 + ((my_mac_addr(0:1)&$f )/10*7) 	# MAC byte 6 1's digit
+
+	call attributes_write(c_device_name,0,20,sr_data(2:18))			# write name to name attribute
+
+	call gap_set_adv_data(0, 25, adv_data(0:25))					# Set advertisement data
+
+	call gap_set_adv_data(1, 20, sr_data(0:20))						# Set scan response data
+	
+	# set advertisement interval to 18.75-21.875ms on all three channels - increments of 625us
+    call gap_set_adv_parameters($20, $28, $07)
+	
+	# set scan parameters to 20ms/20ms interval/window, and use active scanning - increments of 625us
+	call gap_set_scan_parameters($20, $20, 1) # ($35, $35, 1)
+	
+	call sm_set_bondable_mode(1)									 # setup bonding
+  
+  # Seed the random number generator using the last digits of my mac address 
+  # seed = (sr_data(18) << 8) + tmp(19)
+  # call initialize_rand(seed)
+      
+  call gap_set_mode(gap_user_data, gap_undirected_connectable)	# put module into discoverable/connectable mode
+	
+	# set-up interrupt pin from lisa to get get messages when no connection present			
+	call hardware_io_port_irq_enable(0, $40)		# Enable irq - Port 0, enable bit 0x40			
+	call hardware_io_port_irq_direction(0, 1)		#Set I/O port interrupt direction - I/O port 0, trigger on falling edge
+end
+
+# catch connection update event
+event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)    
+	# check for "encrypted" status update (i.e. paired)
+    if (flags & $02) = $02 then
+        # ENCRYPTED
+        # update status
+        encrypted = 1
+	
+	# check for "new connection established" update
+    else 
+		if (flags & $05) = $05 then
+			connected = 1							# CONNECTED AS SLAVE
+			
+			# start spi transaction clock
+			memset(spi_data(0), 0, SPI_DATA_LEN)
+			call hardware_set_soft_timer(SPI_CLOCK, 1, 0)
+		end if
+    end if	
+end
+
+# catch disconnection event
+event connection_disconnected(handle, reason)
+    # DISCONNECTED
+    # update status
+    connected = 0
+    encrypted = 0
+    
+	# disable spi transaction clock
+	call hardware_set_soft_timer(0, 1, 0)
+	
+	# send 0xff to Lisa to indicate loss of connection 
+	memset(spi_data(0), 0, SPI_DATA_LEN)
+	spi_data(0:1) = $ff
+	call hardware_io_port_write(0, $10, 0)
+	call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
+	call hardware_io_port_write(0, $10, $10)
+	
+	if broadcast_mode = 1 then
+		# put module into discoverable/connectible mode
+		call gap_set_mode(gap_user_data, gap_undirected_connectable)(result)
+		if result then
+			call gap_set_mode(gap_user_data, gap_undirected_connectable)
+		end if
+	else
+		call gap_set_mode(gap_user_data, gap_undirected_connectable)	# put module into discoverable/connectable mode
+	end if
+end
+
+# catch scan response event while scanning
+event gap_scan_response(rssi, packet_type, sender, address_type, bond, resp_len, resp_data)
+	# advertising request packet (ADV_REQ) = 3
+	# Scan response packet = 4
+    # only check for scan response packet (packet_type = 4)
+	# if packet_type = 4 then
+	# check if sender is already in the list
+	# if broadcast_mode = 1 then
+		if memcmp (sender(2),MAC_ADDR(0),4) then
+			k = $ff
+			j = 0
+			while j < k_senders
+				if memcmp(senders(j*2), sender(0), 2) then
+					k = j
+				end if
+				j = j + 1
+			end while
+
+			# add to list if not found
+			if k = $ff && k_senders <= NUM_STDMA_SLOTS then
+				memcpy(senders(j*2), sender(0), 2)
+				k = k_senders
+				k_senders = k_senders + 1
+			end if
+
+			# store signal strength
+			sig_strength(k:1) = rssi
+			
+			spi_data(0:1) = $fe
+			spi_data(1:1) = k	# send message sender value
+			spi_data(2:1) = rssi
+			i = 0
+			if resp_len > 16 then			# max spi length is 19 + headers
+				spi_data(3:1) = 16
+				memcpy(spi_data(4),resp_data(0),16)
+				call hardware_io_port_write(0, $10, 0)
+				call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
+				call hardware_io_port_write(0, $10, $10)
+				i = 16
+			end if
+
+			spi_data(3:1) = resp_len-i
+			memcpy(spi_data(4),resp_data(i),resp_len-i)
+			call hardware_io_port_write(0, $10, 0)
+			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
+			call hardware_io_port_write(0, $10, $10)
+		end if
+	#end if
+end
+
+
+# catch timer tick (used for master/slave ping-pong and other things)
+event hardware_soft_timer(handle)
+    # write "ping" update to master (0x44434241 which is "ABCD" in ASCII, big-endian)
+    # this will be pushed via indications if the master has subscribed to them
+		
+	if handle = 0 then
+		counter = counter + 1
+		
+		if counter = 7 then
+			# disable scan
+			call gap_end_procedure()
+			# enable advertisement
+			call gap_set_mode($84, gap_scannable_non_connectable)
+		end if
+		
+		if counter > 7 then
+			# disable advertising
+			# call gap_set_mode($80, gap_scannable_non_connectable)
+			# scan for other modules to get rssi values
+			call gap_discover(gap_discover_observation)
+			
+			counter = 0
+		end if
+	end if
+	
+	if handle = 1 then
+		if in_buf_size > 19 then	# max spi length is 19 + headers
+			spi_data(0:1) = 19
+			memcpy(spi_data(1), in_buf(in_buf_loc), 19)
+			in_buf_loc = 19
+			in_buf_size = in_buf_size - 19
+		else
+			spi_data(0:1) = in_buf_size
+			memcpy(spi_data(1), in_buf(in_buf_loc), in_buf_size)
+			in_buf_loc = 0
+			in_buf_size = 0
+		end if
+		
+		# run spi transaction
+		call hardware_io_port_write(0, $10, 0)			# Enable slave select
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+		call hardware_io_port_write(0, $10, $10)
+		
+		# parse incoming package from lisa
+		if spi_data(0:1) < tlen & spi_data(0:1) > 0 then
+			#Write data to attribute xgatt_data
+			call attributes_write(xgatt_data, 0, spi_data(0), spi_data(1:spi_data(0:1)+1))	# forward message to master
+		end if
+		
+		# reset data parameters
+		in_buf_size = 0
+		in_buf_loc = 0
+		memset(in_buf(0), 0, 31)
+		
+		# reset spi data
+		memset(spi_data(0), 0, SPI_DATA_LEN)
+		
+		# indicate value received to client
+		# call attributes_user_write_response(0, 0)
+	end if	
+end
+
+# catch status update so we know when the other client is connected + subscribed
+event attributes_status(handle, flags)
+    if handle = xgatt_data then
+        if flags = 2 then
+            # INDICATIONS ENABLED
+
+        else
+            # INDICATIONS DISABLED
+
+        end if
+    end if
+end
+
+# handle data sent from Master
+# Relay any data sent form Master to Lisa
+event attributes_value(connection, reason, handle, offset, value_len, value_data)
+    if handle = xgatt_data then
+		if in_buf_size = 0 then		# last message has been successfully handled
+			# copy data into buffer to be sent in next spi transaction
+			in_buf_size = value_len
+			in_buf_loc = 0
+			memcpy(in_buf(0), value_data(0), value_len)
+		end if
+	else # xgatt_data
+		if handle = c_rssi_broadcast then
+			broadcast_mode = value_data(0:1)
+			if broadcast_mode = 1 then
+				call hardware_set_soft_timer(0, 1, 0)					# stop comms timer is running
+				call hardware_set_soft_timer(RSSI_CLOCK, 0, 0)			# start clock to get rssi - clock 32768
+				call gap_discover(gap_discover_observation)				# continue listening for other modules to get rssi				
+			else
+				call hardware_set_soft_timer(0, 0, 0)					# stop rssi clock	
+				call gap_end_procedure()								# stop scanning
+
+				memset(spi_data(0), 0, SPI_DATA_LEN)
+				call hardware_set_soft_timer(SPI_CLOCK, 1, 0)		# restart comms timer
+				
+				# reset listening group
+				memset(senders(0), 0, NUM_STDMA_SLOTS*2)
+				memset(sig_strength(0), 0, NUM_STDMA_SLOTS)
+				k_senders = 0
+			end if
+
+			# inform lisa that broadcast mode has been changed by master
+			memset(spi_data(0), 0, SPI_DATA_LEN)
+			spi_data(0:1) = $fd
+			spi_data(1:1) = broadcast_mode
+			call hardware_io_port_write(0, $10, 0)
+			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+			call hardware_io_port_write(0, $10, $10)
+		end if # c_rssi_broadcast
+	end if # else xgatt_data
+end
+
+# This event is produced when I/O port status changes
+# Relay any data sent from Lisa to Master
+event hardware_io_port_status(timestamp, port, irq, state)
+	# lisa has something to say
+
+	# get message from lisa
+	memset(spi_data(0), 0, SPI_DATA_LEN)
+	call hardware_io_port_write(0, $10, 0)
+	call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+	call hardware_io_port_write(0, $10, $10)
+	
+	if spi_data(0:1) = $fd then
+		if broadcast_mode = 0 then
+			if connected = 1 then
+				call hardware_set_soft_timer(0, 1, 0)				# stop comms timer is running
+			end if
+			call attributes_write(c_rssi_broadcast, 0, 1, $01)		# write broadcast status to attribute
+			call hardware_set_soft_timer(RSSI_CLOCK, 0, 0)			# start clock to get rssi - clock 32768
+			call gap_discover(gap_discover_observation)				# continue listening for other modules to get rssi
+			
+			broadcast_mode = 1
+		else
+			call attributes_write(c_rssi_broadcast, 0, 1, $00)		# write broadcast status to attribute
+			call hardware_set_soft_timer(0, 0, 0)					# stop rssi clock
+			
+			call gap_end_procedure()								# stop scanning
+
+			# continue looking for a connection w/ ground station
+			if connected = 0 then
+				call gap_set_mode(gap_user_data, gap_undirected_connectable)(result)
+				if result then
+					call gap_set_mode(gap_user_data, gap_undirected_connectable)
+				end if
+			else
+				memset(spi_data(0), 0, SPI_DATA_LEN)
+				call hardware_set_soft_timer(SPI_CLOCK, 1, 0)		# restart comms timer
+			end if
+			
+			# reset rssi listening group
+			memset(senders(0), 0, NUM_STDMA_SLOTS*2)
+			memset(sig_strength(0), 0, NUM_STDMA_SLOTS)
+			k_senders = 0
+
+			broadcast_mode = 0
+		end if
+		
+		# inform lisa that interrupt is handled with 0xfd
+		memset(spi_data(0), 0, SPI_DATA_LEN)
+		spi_data(0:1) = $fd
+		spi_data(1:1) = broadcast_mode
+		call hardware_io_port_write(0, $10, 0)
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+		call hardware_io_port_write(0, $10, $10)
+	else
+		if spi_data(0) = $fc then
+			#send all recorded rssi values to lisa
+			spi_data(0:1) = $fc
+			i = 0
+			while k_senders - i > 0
+				if k_senders - i > 16 then
+					spi_data(1:1) = 16
+					spi_data(2:1) = i
+					memcpy(spi_data(3),sig_strength(0),16)
+					call hardware_io_port_write(0, $10, 0)
+					call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+					call hardware_io_port_write(0, $10, $10)
+					i = i + 16
+				else
+					spi_data(1:1) = k_senders - i
+					spi_data(2:1) = i
+					memcpy(spi_data(3),sig_strength(0),k_senders - i)
+					call hardware_io_port_write(0, $10, 0)
+					call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+					call hardware_io_port_write(0, $10, $10)
+					i = k_senders
+				end if
+			end while
+		end if
+	end if	
+end

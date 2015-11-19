@@ -6,6 +6,7 @@ dim t
 dim x
 dim y
 dim z
+dim my_rand_number
 
 export procedure initialize_rand(seed)
     # Use the passed in seed value to initialize the pseudo-random number generator (all variables cannot be zero)
@@ -14,15 +15,17 @@ export procedure initialize_rand(seed)
     x = seed 
     y = seed + 42
     z = seed - 42
-    rand_number = seed * 42
+    my_rand_number = seed * 42
+	rand_number = 0
 end
 
 # Perform a xorshift (https://en.wikipedia.org/wiki/Xorshift) to generate a pseudo-random number
-export procedure rand()
+export procedure rand(limit)
     t = x ^ (x << 11)
     x = y
     y = z 
-    z = rand_number
-    rand_number = rand_number ^ (rand_number >> 19) ^ t ^ (t >> 8)
+    z = my_rand_number
+    my_rand_number = (my_rand_number ^ (my_rand_number >> 19) ^ t ^ (t >> 8))
+	rand_number = my_rand_number - limit*(my_rand_number/limit)
 end
 

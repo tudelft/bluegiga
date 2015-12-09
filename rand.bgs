@@ -26,6 +26,6 @@ export procedure rand(limit)
     y = z 
     z = my_rand_number
     my_rand_number = (my_rand_number ^ (my_rand_number >> 19) ^ t ^ (t >> 8))
-	rand_number = my_rand_number/(2147483648/limit)
+	rand_number = my_rand_number - limit*(my_rand_number/limit)
 end
 

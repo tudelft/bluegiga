@@ -1,18 +1,19 @@
 # ================================================================
 # BGScript demo: Drone-Drone proximity sensor and telemetry
 # Drone side
+# Version number: 0.1
 # 
 # ----------------------------------------------------------------
 #
-#
+# all mac addresses start with $0007802d
 # ================================================================
 
 # lisa message codes
-#	0xff: Communication lost with ground station
-#	0xfe: RSSI value
-#	0xfd: Interrupt handled
-#	0xfc: All stored RSSI
-#	less than 20: Message from connection master
+#	0xff to 0xef: Message from broadcaster
+#	0x52: All stored RSSI
+#	0x51: Interrupt handled
+#	0x50: Communication lost with ground station
+#	0x00 to 0x14: Message from connection master
 
 # ================================================================
 # timer clock: 1s is 32768 ticks
@@ -23,18 +24,21 @@ import "rand.bgs"
 
 # ADVertizement data
 dim adv_data(31)
-dim sr_data(31) 		# custom scan response data (friendly name for active scanning)
-dim my_mac_addr(6) 	# Bluetooth MAC address container
+dim adv_data_len
 
-dim MAC_ADDR(4)
+dim sr_data(31)													# custom scan response data (friendly name for active scanning)
+dim my_mac_addr(6)											# Bluetooth MAC address container
 
 # STDMA variables
+const STDMA_ADV_DATA_HEADER_LEN = 7			# length of header for custom data 
+const STDMA_ADV_HEADER_LEN = 10					# total length of response data package
+const STDMA_ADV_MAX_DATA_LEN = 21				# Max data length
 const STDMA_SLOTS = 8
 # note: transmit packets per frame is fixed to 1 
 
 const STDMA_MIN_INTERVAL = 3						# Min nr of frames before required to reselect
 const STDMA_MAX_INTERVAL = 7						# Max nr of frames before required to reselect
-const STDMA_SELECTION_INTERVAL = 2				# Number of slots to consider around the nominal increment
+const STDMA_SELECTION_INTERVAL = 2			# Number of slots to consider around the nominal increment
 const STDMA_FRAME_DURATION = 6553				# frame interval [clock ticks, 32768 = 1s]
 
 # STDMA states, listed in decreasing priority: internally allocated, externally allocated, busy, free
@@ -43,136 +47,163 @@ const STDMA_STATE_EXTER_ALLOC = 2
 const STDMA_STATE_BUSY = 1
 const STDMA_STATE_FREE = 0
 
-dim stdma_slot_status(8)				# status of each slot stored here
-dim stdma_slot_timeout(8)				# time a reservation is valid
-dim stdma_next_slot_timeout(8)			# next frame reservation
-dim stdma_free_slots(8)					# temporary store of all free slots
+dim stdma_slot_status(8)								# status of each slot stored here
+dim stdma_slot_timeout(8)								# time a reservation is valid
+dim stdma_next_slot_timeout(8)					# next frame reservation
+dim stdma_free_slots(8)									# temporary store of all free slots
 
 dim stdma_my_slot
 dim stdma_my_next_slot
 dim stdma_current_slot
 dim stdma_braodcasting
 
-dim senders(16)	# store last 2 bytes of mac addresses
-dim k_senders
-dim sig_strength(16)
+# advertisement buffer positions
+const POS_ADV_LEN = 3												# length of advertisement data
+const POS_ADV_STDMA_OFFSET = 7							# stdma offset
+const POS_ADV_STDMA_TIMEOUT = 8							# stdma timeout
+const POS_ADV_TX_STRENGTH = 9								# transmit power dBm
 
-const BROADCAST_CLOCK = 819		# slot interval = stdma_frame_duration/STDMA_SLOTS
-dim broadcast_mode
+dim broadcast_msg(31)										# temporary buffer for recieved data waiting to be sent to lisa
+dim rec_tx_strength
+dim rec_rssi
+
+const BROADCAST_CLOCK = 819							# slot interval = stdma_frame_duration/STDMA_SLOTS
 
 # spi variables
-dim in_buf(31)
-dim in_buf_loc
-dim in_buf_size
+dim spi_buf(20)													# spi data waiting to be sent
+const SPI_BUF_LEN = 20
 
+dim spi_clock
+dim spi_broadcast_ratio
 const SPI_DATA_LEN = 20
 dim spi_data(20)
-const SPI_CLOCK = 164		# spi clock 200Hz
+
+dim spi_tlen														# spi transfer temporary variable, not to be used as a persistent variable
+dim spi_channel													# spi transfer temporary variable, not to be used as a persistent variable
+dim spi_result													# spi transfer temporary variable, not to be used as a persistent variable
+dim broadcast_mode											# 0 connection or broadcast, 1 both
+
+# PPRZ MSG positions
+const PPRZ_POS_STX = 0
+const PPRZ_POS_LEN = 1
+const PPRZ_POS_SENDER_ID = 2
+const PPRZ_POS_MSG_ID = 3
 
 # counters
-dim counter
+dim spi_counter
 dim i
 dim j
 dim k
+dim waiting
 
 # misc elements
-dim tlen
-dim channel
-dim result
-dim connected
-dim encrypted
-dim temp
-dim seed
+dim connected									# connection status, 0 = disconnected, 1 = connected 
+dim encrypted									# encryption status, 0 = not encrypted, 1 = encrypted
+dim seed										# seed of the random number generator
+dim temp										# temporary variable, not to be used as a persistent variable
 
-# import "rand.bgs"
 
 # ================================================================
 
-event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
-  # initialize status
-  connected = 0
-  encrypted = 0
 
-	memset(senders(0), 0, 16)
-	memset(sig_strength(0), 0, 8)
-	k_senders = 0
-	broadcast_mode = 0
+# ================================================================
+# Boot
+# ================================================================
+event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
+	# initialize status
+	connected = 0
+	encrypted = 0
+
+	# initialize communication variables
+	broadcast_mode = 1
 	
-	memset(in_buf(0),0,31)
-	in_buf_loc = 0
-	in_buf_size = 0
+	spi_clock = 819																	    # 327 = 10ms, nominal spi rate of 100Hz
+	spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
 	
-	memset(spi_data(0),0,20)
+	memset(spi_buf(0),0,SPI_BUF_LEN)
+	memset(spi_data(0),0,SPI_DATA_LEN)
+	spi_counter = 0
 	
 	# initialise STDMA parameters
 	memset(stdma_slot_status(0), STDMA_STATE_FREE, STDMA_SLOTS)
 	memset(stdma_slot_timeout(0), 0, STDMA_SLOTS)
 	memset(stdma_next_slot_timeout(0), 0, STDMA_SLOTS)
 	memset(stdma_free_slots(0), 0, STDMA_SLOTS)
+	
+	memset(broadcast_msg(0), 0, 31)
+	rec_tx_strength = 0
+	rec_rssi = 0
 
 	stdma_my_slot = 0
 	stdma_my_next_slot = 0
 	stdma_current_slot = 0
 	stdma_braodcasting = 0
-
-	MAC_ADDR(0) = $0007802d							# beginning of the macaddress of Bluegiga modules
+	waiting = 0
 	
+	# configure gpio ports
 	call hardware_io_port_config_direction(0, $10)	# Configure slave select as output
 	call hardware_io_port_write(0, $10, $10)		# Disable slave select
 
 	# Initialize ADV data
 	# Flags = LE General Discovery, single mode device (02 01 06) flags for discoverable/connectible
 	adv_data(0:1) = $02 							# ad field length = 2 bytes
-	adv_data(1:1) = gap_ad_type_flags 				# ad field type = 0x01 (Flags)
+	adv_data(1:1) = gap_ad_type_flags # ad field type = 0x01 (Flags)
 	adv_data(2:1) = $06 							# flags = 0x06, bit 1 General discoverable, bit 2 BR/EDR not supported
-	# tx power field advertisement, Note: when the TX Power Level tag is not present, the TX power level of the packet is unknown.
-	adv_data(3:1) = $02 							# ad field length = 2 bytes
-	adv_data(4:1) = gap_ad_type_txpower 			# ad field type = 0x0A (TX Power)
-	adv_data(5:1) = $08 							# TX power in dBm, can get tx power from system call
 
 	# custom manufacturer
-	adv_data(6:1) = $12 							# ad field length, minimum 3
-	adv_data(7:1) = $ff 							# ad field type = 0xFF (Manufacturer Specific Data)
-	adv_data(8:1) = $ff 							# unknown/prototype Company Identifier Code - octet 2
-	adv_data(9:1) = $ff 							# unknown/prototype Company Identifier Code - octet 1
+	adv_data(3:1) = STDMA_ADV_MAX_DATA_LEN + STDMA_ADV_DATA_HEADER_LEN		# ad field length, minimum 3
+	adv_data(4:1) = $ff 							# ad field type = 0xFF (Manufacturer Specific Data)
+	adv_data(5:1) = $ff 							# unknown/prototype Company Identifier Code - octet 2
+	adv_data(6:1) = $ff 							# unknown/prototype Company Identifier Code - octet 1
 	
-	adv_data(10:1) = $0	 							# stdma offset
-	adv_data(11:1) = $0 							# stdma timeout
-	adv_data(12:1) = $b1 							# Following contains data message
-	adv_data(13:1) = $b2 							# 
-	adv_data(14:1) = $b3 							# 
-	adv_data(15:1) = $b4 							# 
-	adv_data(16:1) = $b5 							# 
-	adv_data(17:1) = $b6 							# 
-	adv_data(18:1) = $b7 							# 
-	adv_data(19:1) = $b8 							# 
-	adv_data(20:1) = $b9 							# 
-	adv_data(21:1) = $b0 							# 
-	adv_data(22:1) = $b1 							# 
-	adv_data(23:1) = $b2 							# 
-	adv_data(24:1) = $b3 							# 
-	adv_data(25:1) = $b4 							#
-	adv_data(26:1) = $b5 							# 
-	adv_data(27:1) = $b6 							# 
-	adv_data(28:1) = $b7 							# 
-	adv_data(29:1) = $b8 							# 
-	adv_data(30:1) = $b9 							#  
+	# stdma header
+	adv_data(7:1) = $0	 							# stdma offset
+	adv_data(8:1) = $0 								# stdma timeout
+
+	# TX power in dBm, can get tx power from system call
+	adv_data(9:1) = $08 								
+	
+	# msg data
+	adv_data_len = STDMA_ADV_MAX_DATA_LEN
+	adv_data(10:1) = $b1 							# Following contains data message
+	adv_data(11:1) = $b2 							# 
+	adv_data(12:1) = $b3 							# 
+	adv_data(13:1) = $b4 							# 
+	adv_data(14:1) = $b5 							# 
+	adv_data(15:1) = $b6 							# 
+	adv_data(16:1) = $b7 							# 
+	adv_data(17:1) = $b8 							# 
+	adv_data(18:1) = $b9 							# 
+	adv_data(19:1) = $b0 							# 
+	adv_data(20:1) = $b1 							# 
+	adv_data(21:1) = $b2 							# 
+	adv_data(22:1) = $b3 							# 
+	adv_data(23:1) = $b4 							# 
+	adv_data(24:1) = $b5 							# 
+	adv_data(25:1) = $b6 							# 
+	adv_data(26:1) = $b7 							# 
+	adv_data(27:1) = $b8 							# 
+	adv_data(28:1) = $b9 							#  
+	adv_data(29:1) = $b1 							#  
+	adv_data(30:1) = $b2 							#  
+	
+	call gap_set_adv_data(0, STDMA_ADV_HEADER_LEN+adv_data_len, adv_data(0:STDMA_ADV_HEADER_LEN+adv_data_len))					# Set advertisement data
 	
 	# build custom scan response data
 	# get Bluetooth MAC address of this device (NOTE: this is little-endian!)
 	call system_address_get()(my_mac_addr(0:6))
 	sr_data(0:1) = $13 								# ad field length = 19 bytes (0x13)
 	sr_data(1:1) = gap_ad_type_localname_complete 	# ad field type = 0x09 (Complete local name)
-	sr_data(2:1) = $4c 		# 'L'
-	sr_data(3:1) = $61 		# 'a'
-	sr_data(4:1) = $64 		# 'd'
-	sr_data(5:1) = $79 		# 'y'
-	sr_data(6:1) = $20 		# ' '
-	sr_data(7:1) = $4c 		# 'L'
-	sr_data(8:1) = $69 		# 'i'
-	sr_data(9:1) = $73 		# 's'
-	sr_data(10:1) = $61 	# 'a'
-	sr_data(11:1) = $20 	# ' '
+	sr_data(2:1) = $4c 								# 'L'
+	sr_data(3:1) = $61 								# 'a'
+	sr_data(4:1) = $64 								# 'd'
+	sr_data(5:1) = $79 								# 'y'
+	sr_data(6:1) = $20 								# ' '
+	sr_data(7:1) = $4c 								# 'L'
+	sr_data(8:1) = $69 								# 'i'
+	sr_data(9:1) = $73 								# 's'
+	sr_data(10:1) = $61 							# 'a'
+	sr_data(11:1) = $20 							# ' '
 	sr_data(12:1) = (my_mac_addr(2:1)/$10) + 48 + ((my_mac_addr(2:1)/$10)/10*7) # MAC byte 4 10's digit
 	sr_data(13:1) = (my_mac_addr(2:1)&$f) + 48 + ((my_mac_addr(2:1)&$f )/10*7) 	# MAC byte 4 1's digit
 	sr_data(14:1) = $3a # ':'
@@ -184,15 +215,22 @@ event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
 
 	call attributes_write(c_device_name,0,20,sr_data(2:18))			# write name to name attribute
 
-	call gap_set_adv_data(0, 31, adv_data(0:31))					# Set advertisement data
-
 	call gap_set_adv_data(1, 31, sr_data(0:31))						# Set scan response data
 	
-	# set advertisement interval to 20-25ms on all three channels - increments of 625us
-	call gap_set_adv_parameters($28, $30, $07)	# ($20, $28, $07)
+	# set advertisement interval on all three spi_channels
+	# increments of 625us
+	# range (0x20 - 0x4000)
+	# 0x07: All three channels are used
+	# 0x03: Advertisement channels 37 and 38 are used.
+	# 0x04: Only advertisement channel 39 is used
+	call gap_set_adv_parameters($20, $28, $07)
 	
-	# set scan parameters to 20ms/20ms interval/window, and use active scanning - increments of 625us
-	call gap_set_scan_parameters($28, $28, 0) # ($35, $35, 1)
+	# set scan parameters interval/window/use active scanning
+	# the scan interval defines the period between restarting a scan, each new scan will switch to a new channel
+	# increments of 625us
+	# range: 0x4 - 0x4000
+	# with active scanning receiver will send a scan response msg
+	call gap_set_scan_parameters($28, $28, 0)						# the values selected should be a multiple of the stdma interval
 	
 	call sm_set_bondable_mode(1)									 # setup bonding
   
@@ -201,260 +239,139 @@ event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
 	call initialize_rand(seed)
 	
 	# set-up interrupt pin from lisa to get get messages when no connection present			
-	call hardware_io_port_irq_enable(0, $40)		# Enable irq - Port 0, enable bit 0x40			
-	call hardware_io_port_irq_direction(0, 1)		#Set I/O port interrupt direction - I/O port 0, trigger on falling edge
+	call hardware_io_port_irq_enable(0, $40)						# Enable irq - Port 0, enable bit 0x40			
+	call hardware_io_port_irq_direction(0, 1)						# Set I/O port interrupt direction - I/O port 0, trigger on falling edge
 	
 	call hardware_set_soft_timer(STDMA_FRAME_DURATION*2, 2, 1)		# start STDMA
 	
-	call gap_discover(gap_discover_observation)			# scan for other modules
+	call gap_discover(gap_discover_observation)		# scan for other modules
 end
 
-procedure initialise_variables()
-
-
-end
-
+# ================================================================
 # catch connection update event
-event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)    
+# ================================================================
+event connection_status(connection, flags, address, address_type, conn_interval, timeout, latency, bonding)
 	# check for "encrypted" status update (i.e. paired)
     if (flags & $02) = $02 then
         # ENCRYPTED
         # update status
         encrypted = 1
-	
+	end if
 	# check for "new connection established" update
-	else
-		if (flags & $05) = $05 then
-			connected = 1							# CONNECTED AS SLAVE
+	if (flags & $05) = $05  && connected = 0 then
+		connected = 1							# CONNECTED AS SLAVE
+		
+		spi_clock = (conn_interval*32768*5)/(1000*4)										# set spi salve speed to max connection interval units 1.25 (5/4)
+		spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+
+		# stop clocks
+		call hardware_set_soft_timer(0, 0, 0)
+		call hardware_set_soft_timer(0, 1, 0)
+		call hardware_set_soft_timer(0, 2, 0)
+		
+		# send 0x50 to Lisa to indicate new of connection 
+		memset(spi_data(0), 0, SPI_DATA_LEN)
+		spi_data(0:1) = $50
+		spi_data(1:1) = connected
+		call hardware_io_port_write(0, $10, 0)
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
+		call hardware_io_port_write(0, $10, $10)
+
+		# start spi transaction clock
+		memset(spi_data(0), 0, SPI_DATA_LEN)
+		call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)
+	end if
 	
-			# stop clocks
-			call hardware_set_soft_timer(0, 0, 0)
-			call hardware_set_soft_timer(0, 2, 0)
-			
-			broadcast_mode = 0
-			
-			# start spi transaction clock
-			memset(spi_data(0), 0, SPI_DATA_LEN)
-			call hardware_set_soft_timer(SPI_CLOCK, 1, 0)
-		end if
+	# check for "encrypted" status update (i.e. paired)
+    if (flags & $08) = $08 then
+        # update status
+        spi_clock = (conn_interval*32768*5)/(1000*4)										# set spi salve speed to max connection interval units 1.25 (5/4)
+		spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+		
+		# stop clocks
+		call hardware_set_soft_timer(0, 0, 0)
+		call hardware_set_soft_timer(0, 1, 0)
+		call hardware_set_soft_timer(0, 2, 0)
+		
+		call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)
 	end if
 end
 
 # catch disconnection event
 event connection_disconnected(handle, reason)
     # DISCONNECTED
+
     # update status
     connected = 0
     encrypted = 0
-    
-	# disable spi transaction clock
-	call hardware_set_soft_timer(0, 1, 0)
 	
-	# send 0xff to Lisa to indicate loss of connection 
+	spi_clock = 819																	    # 327 = 10ms, nominal spi rate of 100Hz
+	spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+	
+	# send 0x50 to Lisa to indicate loss of connection 
 	memset(spi_data(0), 0, SPI_DATA_LEN)
-	spi_data(0:1) = $ff
+	spi_data(0:1) = $50
+	spi_data(1:1) = connected
 	call hardware_io_port_write(0, $10, 0)
 	call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
 	call hardware_io_port_write(0, $10, $10)
 
-	# reset slot status	
-	memset(stdma_slot_status(0), STDMA_STATE_BUSY, STDMA_SLOTS)
-	memset(stdma_slot_timeout(0), 0, STDMA_SLOTS)
-	memset(stdma_next_slot_timeout(0), 0, STDMA_SLOTS)
-	memset(stdma_free_slots(0), 0, STDMA_SLOTS)
-
-	# reinitialise STDMA parameters
-	stdma_my_slot = 0
-	stdma_my_next_slot = 0
-	stdma_current_slot = 0
-	stdma_braodcasting = 0
-		
-	call hardware_set_soft_timer(STDMA_FRAME_DURATION*2, 2, 1)			# restart STDMA
-	
-	call gap_discover(gap_discover_observation)			# scan for other modules
+	if broadcast_mode = 0
+		call hardware_set_soft_timer(0, 0, 0)								# stop clocks
+		call gap_discover(gap_discover_observation)							# scan for other modules
+	end if
 end
 
+# ================================================================
 # catch scan response event
+# ================================================================
 event gap_scan_response(rssi, packet_type, sender, address_type, bond, resp_len, resp_data)
 	# advertising request packet (ADV_REQ) = 3
 	# Scan response packet = 4
     # only check for scan response packet (packet_type = 4)
 	# if packet_type = 4 then
 	# check if sender is already in the list
-	#if memcmp (sender(2),MAC_ADDR(0),4) then
-		k = $ff
-		j = 0
-		while j < k_senders
-			if memcmp(senders(j*2), sender(0), 2) then
-				k = j
-				j = k_senders - 1		# exit loop
-			end if
-			j = j + 1
-		end while
-
-		# add to list if not found
-		if k = $ff && k_senders < STDMA_SLOTS then
-			memcpy(senders(j*2), sender(0), 2)
-			k = k_senders
-			k_senders = k_senders + 1
-		end if
-
-		# store signal strength
-		sig_strength(k:1) = rssi
-		
+	if memcmp (sender(3),my_mac_addr(3),3) then		# check if sender is likely a bluegiga module or dongle
+	
 		# store stdma slot, offset and timeout
 		# response data is [offset, timeout, data]
-		temp = stdma_current_slot + resp_data(10:1)			# next reserved slot
-		while temp > STDMA_SLOTS							# wrap index on number of slots
+		temp = stdma_current_slot + resp_data(POS_ADV_STDMA_OFFSET:1)										# next reserved slot
+		while temp > STDMA_SLOTS														# wrap index on number of slots
 			temp = temp - STDMA_SLOTS
 		end while
 		
-		if stdma_next_slot_timeout(temp:1) != stdma_my_slot then
-			stdma_next_slot_timeout(temp:1) = resp_data(11:1)
+		if temp != stdma_my_next_slot && resp_data(POS_ADV_STDMA_TIMEOUT:1) > stdma_next_slot_timeout(temp:1) then
+			stdma_next_slot_timeout(temp:1)  = resp_data(POS_ADV_STDMA_TIMEOUT:1)
 		end if
 		
-		spi_data(0:1) = $fe
-		spi_data(1:1) = k									# send message sender value
-		spi_data(2:1) = rssi
-		i = 0
-		if resp_len-12-4 > 20 then								# max spi length is 20 - headers
-			spi_data(3:1) = 16
-			memcpy(spi_data(4),resp_data(12),16)
-			call hardware_io_port_write(0, $10, 0)
-			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
-			call hardware_io_port_write(0, $10, $10)
-			i = 16
+		# send received data over spi
+		if (resp_len - STDMA_ADV_HEADER_LEN) <= STDMA_ADV_MAX_DATA_LEN then		# sanity check
+			rec_tx_strength = resp_data(POS_ADV_TX_STRENGTH)
+			rec_rssi = rssi
+			broadcast_msg(0:1) = resp_len - STDMA_ADV_HEADER_LEN
+			memcpy(broadcast_msg(1), resp_data(STDMA_ADV_HEADER_LEN), resp_len - STDMA_ADV_HEADER_LEN)
 		end if
-
-		spi_data(3:1) = resp_len-i
-		memcpy(spi_data(4),resp_data(i+12),resp_len-12-i)
-		call hardware_io_port_write(0, $10, 0)
-		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))
-		call hardware_io_port_write(0, $10, $10)
-	#end if
+	end if
 end
 
-
+# ================================================================
 # catch timer tick (used for master/slave ping-pong and other things)
+# ================================================================
 event hardware_soft_timer(handle)
     # write "ping" update to master (0x44434241 which is "ABCD" in ASCII, big-endian)
     # this will be pushed via indications if the master has subscribed to them
-		
-	if handle = 0 then			
-		# stop broadcasting if I just was
-		if stdma_braodcasting = 1 then
-			call gap_set_mode(0, 0)	# stop advertisement
-			call gap_discover(gap_discover_observation)			# scan for other modules to get rssi values
-			stdma_braodcasting = 0
-		end if
-		
-		# increment current slot number
-		stdma_current_slot = stdma_current_slot + 1
-		if stdma_current_slot = STDMA_SLOTS then				# end of frame
-			stdma_current_slot = 0								# wrap slot counter
-			
-			# decrement timeout values
-			i = 0
-			while i < STDMA_SLOTS
-				if stdma_slot_timeout(i:1) > 0 then
-					stdma_slot_timeout(i:1) = stdma_slot_timeout(i:1) - 1
-					
-					if stdma_slot_timeout(i:1) = 0 then
-						stdma_slot_status(i:1) = STDMA_STATE_FREE				# update slot statuses
-					end if
-				end if
-				
-				if stdma_next_slot_timeout(i:1) > stdma_slot_timeout(i:1) then		# copy next statuses to list
-					stdma_slot_timeout(i:1) = stdma_next_slot_timeout(i:1)
-					stdma_next_slot_timeout(i:1) = stdma_next_slot_timeout(i:1) - 1
-					stdma_slot_status(i:1) = STDMA_STATE_EXTER_ALLOC
-				else
-					if stdma_next_slot_timeout(i:1) > 0 then
-						stdma_next_slot_timeout(i:1) = 0
-					end if
-				end if
-				i = i + 1
-			end while
-			
-			# check if my slot is about to expire, if so then broadcast and select new one
-			# This logic give the same location double the possible slot options
-			if stdma_slot_timeout(stdma_my_slot) = 0 then
-				# find free slots in selection interval
-				k = 0
-				i = 0 - STDMA_SELECTION_INTERVAL
-				while i <= STDMA_SELECTION_INTERVAL
-					if (stdma_my_slot + i > 0) && (stdma_my_slot + i < STDMA_SLOTS) then
-						j = stdma_my_slot + i
-					else
-						if stdma_my_slot + i < 0 then
-							j = stdma_my_slot + i + STDMA_SLOTS
-						else
-							j = stdma_my_slot + i - STDMA_SLOTS
-						end if
-					end if
-					
-					if stdma_slot_status(j:1) = STDMA_STATE_FREE then
-						stdma_free_slots(k:1) = j
-						k = k + 1
-					end if
-					i = i + 1
-				end while
-
-				# determine next slot using random offset
-				if k > 0 then
-					call rand(k)
-					stdma_my_next_slot = stdma_free_slots(rand_number:1)
-				end if
-				stdma_slot_status(stdma_my_next_slot:1) = STDMA_STATE_INTER_ALLOC
-				
-				# determine new timeout
-				call rand(STDMA_MAX_INTERVAL - STDMA_MIN_INTERVAL)
-				stdma_slot_timeout(stdma_my_next_slot:1) = rand_number + STDMA_MIN_INTERVAL
-			end if
-		end if
-		
-		if stdma_current_slot = stdma_my_slot
-			stdma_my_slot = stdma_my_next_slot
-			# set advertisement data
-			adv_data(10:1) = STDMA_SLOTS - stdma_current_slot + stdma_my_slot				# offset to next transmission
-			adv_data(11:1) = stdma_slot_timeout(stdma_my_slot:1)
-			
-			# debugging
-			memcpy(adv_data(12), stdma_slot_timeout(0), STDMA_SLOTS)
-			memcpy(adv_data(20), sig_strength(0), STDMA_SLOTS)
-			adv_data(21:1) = stdma_my_slot
-			
-			call gap_set_adv_data(0, 31, adv_data(0:31))					# Set advertisement data
-			
-			# broadcast!
-			call gap_end_procedure()										# disable scan
-			call gap_set_mode(gap_user_data, gap_undirected_connectable)	# enable advertisement, gap_user_data scan response
-
-			stdma_braodcasting = 1
-		end if
-	end if
 	
-	if handle = 1 then
-		spi_data(0:1) = in_buf_size
-		memcpy(spi_data(1), in_buf(in_buf_loc), in_buf_size)
-		in_buf_loc = 0
-		in_buf_size = 0
-		
+	if handle = 0 then
 		# run spi transaction
 		call hardware_io_port_write(0, $10, 0)			# Enable slave select
-		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
 		call hardware_io_port_write(0, $10, $10)
 		
 		# parse incoming package from lisa
-		if spi_data(0:1) < tlen & spi_data(0:1) > 0 then
+		if connected && spi_data(0:1) < spi_tlen && spi_data(0:1) > 0 then
 			#Write data to attribute xgatt_data
-			call attributes_write(xgatt_data, 0, spi_data(0), spi_data(1:spi_data(0:1)+1))	# forward message to master
+			call attributes_write(xgatt_data, 0, spi_data(0:1), spi_data(1:spi_data(0:1)))	# forward message to master
 		end if
-		
-		# reset data parameters
-		in_buf_size = 0
-		in_buf_loc = 0
-		memset(in_buf(0), 0, 31)
 		
 		# reset spi data
 		memset(spi_data(0), 0, SPI_DATA_LEN)
@@ -463,9 +380,165 @@ event hardware_soft_timer(handle)
 		# call attributes_user_write_response(0, 0)
 	end if
 	
+	if handle = 1 then
+		spi_counter = spi_counter + 1
+		if (spi_counter - spi_broadcast_ratio*(spi_counter/spi_broadcast_ratio)) = 0 then	# modulo
+			spi_counter = 0
+			# stop broadcasting if I just was
+			if stdma_braodcasting = 1 then
+				call gap_set_mode(0, 0)	# stop advertisement
+				call gap_discover(gap_discover_observation)			# scan for other modules to get rssi values
+				stdma_braodcasting = 0
+			end if
+			
+			# increment current slot number
+			stdma_current_slot = stdma_current_slot + 1
+			if stdma_current_slot = STDMA_SLOTS then				# end of frame
+				stdma_current_slot = 0								# wrap slot counter
+				
+				# decrement timeout values
+				i = 0
+				while i < STDMA_SLOTS
+					if stdma_slot_timeout(i:1) > 0 then
+						stdma_slot_timeout(i:1) = stdma_slot_timeout(i:1) - 1
+					end if
+					if stdma_slot_timeout(i:1) = 0 then
+						stdma_slot_status(i:1) = STDMA_STATE_FREE				# update slot statuses
+					end if
+					
+					if stdma_next_slot_timeout(i:1) > stdma_slot_timeout(i:1) then		# copy next statuses to list
+						stdma_slot_timeout(i:1) = stdma_next_slot_timeout(i:1)
+						stdma_slot_status(i:1) = STDMA_STATE_EXTER_ALLOC
+					end if
+					stdma_next_slot_timeout(i:1) = 0
+					i = i + 1
+				end while
+				
+				# check if my slot is about to expire, if so then broadcast and select new one
+				# This logic give the same location double the possible slot options
+				if stdma_slot_timeout(stdma_my_slot:1) = 0 then
+					# find free slots in selection interval
+					k = 1
+					stdma_free_slots(0:1) = stdma_my_slot
+					i = 0 - STDMA_SELECTION_INTERVAL
+					while i <= STDMA_SELECTION_INTERVAL
+						j = stdma_my_slot + i
+						# bound in [0,STDMA_SLOTS)
+						while j < 0
+							j = j + STDMA_SLOTS
+						end while
+						while j >= STDMA_SLOTS
+							j = j - STDMA_SLOTS
+						end while
+						
+						if stdma_slot_status(j:1) = STDMA_STATE_FREE then
+							stdma_free_slots(k:1) = j
+							k = k + 1
+						end if
+						i = i + 1
+					end while
+
+					# determine next slot using random offset
+					call rand(k)
+					stdma_my_next_slot = stdma_free_slots(rand_number:1)
+					stdma_slot_status(stdma_my_next_slot:1) = STDMA_STATE_INTER_ALLOC
+					
+					# determine new timeout
+					call rand(STDMA_MAX_INTERVAL - STDMA_MIN_INTERVAL)
+					stdma_slot_timeout(stdma_my_next_slot:1) = rand_number + STDMA_MIN_INTERVAL
+				end if
+			end if
+			
+			if stdma_current_slot = stdma_my_slot
+				stdma_my_slot = stdma_my_next_slot
+				# set advertisement data
+				adv_data(POS_ADV_STDMA_OFFSET:1) = stdma_my_slot - stdma_current_slot + STDMA_SLOTS		# offset to next transmission
+				if adv_data(POS_ADV_STDMA_OFFSET:1) > 2*STDMA_SLOTS then
+					adv_data(POS_ADV_STDMA_OFFSET:1) = adv_data(POS_ADV_STDMA_OFFSET:1)  - STDMA_SLOTS
+				end if
+				adv_data(POS_ADV_STDMA_TIMEOUT:1) = stdma_slot_timeout(stdma_my_slot:1)
+
+				adv_data(POS_ADV_LEN:1) = adv_data_len + STDMA_ADV_DATA_HEADER_LEN
+				call gap_set_adv_data(0, STDMA_ADV_HEADER_LEN+adv_data_len, adv_data(0:STDMA_ADV_HEADER_LEN+adv_data_len))					# Set advertisement data
+				#adv_data_len = 0	# reset
+				
+				# broadcast!
+				call gap_end_procedure()												# disable scan
+				# enable advertisement
+				if connected then
+					call gap_set_mode(gap_user_data, gap_scannable_non_connectable)
+				else
+					call gap_set_mode(gap_user_data, gap_undirected_connectable)
+				end if
+
+				stdma_braodcasting = 1
+			end if
+		end if
+		
+		# handle spi
+		if (broadcast_msg(0:1) > 0) then
+			spi_data(1:1) = rec_tx_strength										# tx_strength
+			spi_data(2:1) = rec_rssi 													# rssi
+			
+			if broadcast_msg(0:1) > SPI_DATA_LEN - 3 then
+				spi_data(0:1) = $ff - (SPI_DATA_LEN - 3)				# encode msg length in header
+				memcpy(spi_data(3), broadcast_msg(1), SPI_DATA_LEN - 3)
+				
+				memcpy(broadcast_msg(1), broadcast_msg(SPI_DATA_LEN - 3), broadcast_msg(0:1) - (SPI_DATA_LEN - 3))
+				broadcast_msg(0:1) = broadcast_msg(0:1) - (SPI_DATA_LEN - 3)
+		    else
+		  	    spi_data(0:1) = $ff - broadcast_msg(0:1)				# encode msg length in header
+			    memcpy(spi_data(3), broadcast_msg(1), broadcast_msg(0:1))
+				memset(broadcast_msg(0), 0, 31)
+		    end if
+		else
+			if spi_buf(0:1) > 0 then				# no broadcast msg
+				memcpy(spi_data(0), spi_buf(0), SPI_BUF_LEN)
+				memset(spi_buf(0), 0, SPI_BUF_LEN)
+			end if
+		end if
+				
+		# run spi transaction
+		call hardware_io_port_write(0, $10, 0)			# Enable slave select
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
+		call hardware_io_port_write(0, $10, $10)
+		
+		# parse incoming package from lisa
+		if connected && spi_data(0:1) > 0 && spi_data(0:1) < spi_tlen then
+			call attributes_write(xgatt_data, 0, spi_data(0:1), spi_data(1:spi_data(0:1)))	# forward message to connection
+		end if
+		
+		# only send message 252, in this config, this msg not sent to ground
+		# && spi_data(1+PPRZ_POS_LEN:1) <= STDMA_ADV_MAX_DATA_LEN && spi_data(1+PPRZ_POS_LEN:1) > SPI_DATA_LEN 252
+		if spi_data(0:1) > 0 && spi_data(1+PPRZ_POS_STX:1) = $99 && spi_data(1+PPRZ_POS_MSG_ID:1) = 252 then
+			adv_data_len = spi_data(0:1)
+			temp = spi_data(1+PPRZ_POS_LEN:1)
+			memcpy(adv_data(STDMA_ADV_HEADER_LEN), spi_data(1), spi_data(0:1))
+			
+			memcpy(spi_data(0), spi_buf(0), SPI_BUF_LEN)
+				
+			# run spi transaction
+			call hardware_io_port_write(0, $10, 0)			# Enable slave select
+			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
+			call hardware_io_port_write(0, $10, $10)
+			
+			memcpy(adv_data(STDMA_ADV_HEADER_LEN + adv_data_len), spi_data(1), temp - adv_data_len)
+			adv_data_len = temp
+			
+			adv_data(POS_ADV_LEN:1) = adv_data_len + STDMA_ADV_DATA_HEADER_LEN
+		end if
+		
+		#adv_data_len = 8
+		#memcpy(adv_data(STDMA_ADV_HEADER_LEN), stdma_slot_status(0), adv_data_len)
+
+		# reset spi data
+		memset(spi_data(0), 0, SPI_DATA_LEN)
+	end if
+	
 	# Network entry period over
 	if handle = 2 then
 		memcpy(stdma_slot_timeout(0), stdma_next_slot_timeout(0), STDMA_SLOTS)
+		
 		# pick first slot
 		i = 0
 		k = 0
@@ -477,32 +550,45 @@ event hardware_soft_timer(handle)
 			i = i + 1
 		end while
 
-		# determine next slot using random offset 
-		call rand(k)
-		stdma_my_slot = stdma_free_slots(rand_number:1)
-		stdma_my_next_slot = stdma_my_slot
+		# determine next slot using random offset
+		if k > 0 then
+			call rand(k)
+			stdma_my_slot = stdma_free_slots(rand_number:1)
+		else
+			stdma_my_slot = 0
+		end if
 		
+		stdma_my_next_slot = stdma_my_slot
 		stdma_slot_timeout(stdma_my_slot:1) = STDMA_MAX_INTERVAL
 		stdma_slot_status(stdma_my_slot:1) = STDMA_STATE_INTER_ALLOC
 		
 		# set advertisement data
-		adv_data(10:1) = stdma_my_slot
-		adv_data(11:1) = stdma_slot_timeout(stdma_my_slot:1)
+		adv_data(POS_ADV_STDMA_OFFSET:1) = stdma_my_slot + STDMA_SLOTS
+		adv_data(POS_ADV_STDMA_TIMEOUT:1) = stdma_slot_timeout(stdma_my_slot:1)
 		
-		call gap_set_adv_data(0, 31, adv_data(0:31))					# Set advertisement data
+		adv_data(POS_ADV_LEN:1) = adv_data_len + STDMA_ADV_DATA_HEADER_LEN
+		
+		call gap_set_adv_data(0, STDMA_ADV_HEADER_LEN+adv_data_len, adv_data(0:STDMA_ADV_HEADER_LEN+adv_data_len))					# Set advertisement data
 		
 		# broadcast to everyone your entering the fray
-		call gap_end_procedure()										# disable scan
-		call gap_set_mode(gap_user_data, gap_undirected_connectable)	# enable advertisement
+		call gap_end_procedure()											# disable scan
+		
+		# enable advertisement
+		if connected then
+			call gap_set_mode(gap_user_data, gap_scannable_non_connectable)
+		else
+			call gap_set_mode(gap_user_data, gap_undirected_connectable)
+		end if
 
-		broadcast_mode = 1
 		stdma_braodcasting = 1
 		
-		call hardware_set_soft_timer(BROADCAST_CLOCK, 0, 0)		# start broadcast clock
+		call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)		# start broadcast clock
 	end if
 end
 
+# ================================================================
 # catch status update so we know when the other client is connected + subscribed
+# ================================================================
 event attributes_status(handle, flags)
     if handle = xgatt_data then
         if flags = 2 then
@@ -519,120 +605,76 @@ end
 # Relay any data sent form Master to Lisa
 event attributes_value(connection, reason, handle, offset, value_len, value_data)
     if handle = xgatt_data then
-		if in_buf_size = 0 then		# last message has been successfully handled
+		if spi_buf(0:1) = 0 then									# last message has been successfully handled
 			# copy data into buffer to be sent in next spi transaction
-			in_buf_size = value_len
-			in_buf_loc = 0
-			memcpy(in_buf(0), value_data(0), value_len)
+			if value_len <= SPI_DATA_LEN - 1 then					# safety check
+				spi_buf(0:1) = value_len
+				memcpy(spi_buf(1), value_data(0), value_len)
+				
+				# debug msg received
+				#if value_data(PPRZ_POS_STX:1) = $99 && value_data(PPRZ_POS_MSG_ID:1) = 2 then
+				#	adv_data_len = value_len
+				#	
+				#	memcpy(adv_data(STDMA_ADV_HEADER_LEN), value_data(1), value_len)
+				#	
+				#	adv_data(POS_ADV_LEN:1) = adv_data_len + STDMA_ADV_DATA_HEADER_LEN
+				#end if
+				
+			end if
 		end if
 	else # xgatt_data
 		if handle = c_rssi_broadcast then
-			broadcast_mode = value_data(0:1)
-			if broadcast_mode = 1 then
-				call hardware_set_soft_timer(0, 1, 0)					# stop comms timer is running
-				call hardware_set_soft_timer(BROADCAST_CLOCK, 0, 0)			# start clock to get rssi - clock 32768
-				call gap_discover(gap_discover_observation)				# continue listening for other modules to get rssi				
-			else
-				call hardware_set_soft_timer(0, 0, 0)					# stop rssi clock	
-				call gap_end_procedure()								# stop scanning
-
-				memset(spi_data(0), 0, SPI_DATA_LEN)
-				call hardware_set_soft_timer(SPI_CLOCK, 1, 0)		# restart comms timer
+			if value_data(0:1) != broadcast_mode && value_data(0:1) < 2
+				broadcast_mode = value_data(0:1)
 				
-				# reset listening group
-				memset(senders(0), 0, STDMA_SLOTS*2)
-				memset(sig_strength(0), 0, STDMA_SLOTS)
-				k_senders = 0
+				# stop clocks
+				call hardware_set_soft_timer(0, 0, 0)
+				call hardware_set_soft_timer(0, 1, 0)
+				call hardware_set_soft_timer(0, 2, 0)
+				
+				call hardware_set_soft_timer(STDMA_FRAME_DURATION*2, 2, 1)			# restart STDMA
+				call gap_discover(gap_discover_observation)							# continue listening for other modules to get rssi
 			end if
 
 			# inform lisa that broadcast mode has been changed by master
 			memset(spi_data(0), 0, SPI_DATA_LEN)
-			spi_data(0:1) = $fd
+			spi_data(0:1) = $53
 			spi_data(1:1) = broadcast_mode
 			call hardware_io_port_write(0, $10, 0)
-			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+			call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
 			call hardware_io_port_write(0, $10, $10)
 		end if # c_rssi_broadcast
-	end if # else xgatt_data
+	end if # xgatt_data
 end
 
+# ================================================================
 # This event is produced when I/O port status changes
 # Relay any data sent from Lisa to Master
+# ================================================================
 event hardware_io_port_status(timestamp, port, irq, state)
 	# lisa has something to say
 
 	# get message from lisa
 	memset(spi_data(0), 0, SPI_DATA_LEN)
 	call hardware_io_port_write(0, $10, 0)
-	call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+	call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
 	call hardware_io_port_write(0, $10, $10)
-	
-	if spi_data(0:1) = $fd then
-		if broadcast_mode = 0 then
-			if connected = 1 then
-				call hardware_set_soft_timer(0, 1, 0)				# stop comms timer is running
-			end if
-			call attributes_write(c_rssi_broadcast, 0, 1, $01)		# write broadcast status to attribute
-			call hardware_set_soft_timer(BROADCAST_CLOCK, 0, 0)			# start clock to get rssi - clock 32768
-			call gap_discover(gap_discover_observation)				# continue listening for other modules to get rssi
-			
-			broadcast_mode = 1
-		else
-			call attributes_write(c_rssi_broadcast, 0, 1, $00)		# write broadcast status to attribute
-			call hardware_set_soft_timer(0, 0, 0)					# stop rssi clock
-			
-			call gap_end_procedure()								# stop scanning
 
-			# continue looking for a connection w/ ground station
-			if connected = 0 then
-				call gap_set_mode(gap_user_data, gap_undirected_connectable)(result)
-				if result then
-					call gap_set_mode(gap_user_data, gap_undirected_connectable)
-				end if
-			else
-				memset(spi_data(0), 0, SPI_DATA_LEN)
-				call hardware_set_soft_timer(SPI_CLOCK, 1, 0)		# restart comms timer
-			end if
-			
-			# reset rssi listening group
-			memset(senders(0), 0, STDMA_SLOTS*2)
-			memset(sig_strength(0), 0, STDMA_SLOTS)
-			k_senders = 0
-
-			broadcast_mode = 0
-		end if
+	if spi_data(0:1) > SPI_DATA_LEN && spi_data(0:1) < STDMA_ADV_MAX_DATA_LEN then
+		adv_data_len = spi_data(0:1)
+		memcpy(adv_data(STDMA_ADV_HEADER_LEN), spi_data(1), SPI_DATA_LEN-1)
 		
-		# inform lisa that interrupt is handled with 0xfd
-		memset(spi_data(0), 0, SPI_DATA_LEN)
-		spi_data(0:1) = $fd
-		spi_data(1:1) = broadcast_mode
 		call hardware_io_port_write(0, $10, 0)
-		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
+		call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(spi_result, spi_channel, spi_tlen, spi_data(0:SPI_DATA_LEN))
 		call hardware_io_port_write(0, $10, $10)
+		
+		memcpy(adv_data(STDMA_ADV_HEADER_LEN + SPI_DATA_LEN - 1), spi_data(0), adv_data_len - (SPI_DATA_LEN - 1))
 	else
-		if spi_data(0) = $fc then
-			#send all recorded rssi values to lisa
-			spi_data(0:1) = $fc
-			i = 0
-			while k_senders - i > 0
-				if k_senders - i > 16 then
-					spi_data(1:1) = 16
-					spi_data(2:1) = i
-					memcpy(spi_data(3),sig_strength(0),16)
-					call hardware_io_port_write(0, $10, 0)
-					call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
-					call hardware_io_port_write(0, $10, $10)
-					i = i + 16
-				else
-					spi_data(1:1) = k_senders - i
-					spi_data(2:1) = i
-					memcpy(spi_data(3),sig_strength(0),k_senders - i)
-					call hardware_io_port_write(0, $10, 0)
-					call hardware_spi_transfer(0, SPI_DATA_LEN, spi_data(0:SPI_DATA_LEN))(result, channel, tlen, spi_data(0:SPI_DATA_LEN))
-					call hardware_io_port_write(0, $10, $10)
-					i = k_senders
-				end if
-			end while
-		end if
-	end if	
+		adv_data_len = spi_data(0:1)
+		memcpy(adv_data(STDMA_ADV_HEADER_LEN), spi_data(1), adv_data_len)
+	end if
+	
+	adv_data(POS_ADV_LEN:1) = adv_data_len + STDMA_ADV_DATA_HEADER_LEN
+	call gap_set_adv_data(0, STDMA_ADV_HEADER_LEN+adv_data_len, adv_data(0:STDMA_ADV_HEADER_LEN+adv_data_len))					# Set advertisement data		
+	
 end

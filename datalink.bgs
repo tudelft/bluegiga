@@ -30,7 +30,7 @@ dim sr_data(31)													# custom scan response data (friendly name for activ
 dim my_mac_addr(6)											# Bluetooth MAC address container
 
 # STDMA variables
-const STDMA_ADV_DATA_HEADER_LEN = 7			# length of header for custom data 
+const STDMA_ADV_DATA_HEADER_LEN = 6			# length of header for custom data 
 const STDMA_ADV_HEADER_LEN = 10					# total length of response data package
 const STDMA_ADV_MAX_DATA_LEN = 21				# Max data length
 const STDMA_SLOTS = 8
@@ -72,6 +72,8 @@ const BROADCAST_CLOCK = 819							# slot interval = stdma_frame_duration/STDMA_S
 # spi variables
 dim spi_buf(20)													# spi data waiting to be sent
 const SPI_BUF_LEN = 20
+
+dim skip    # skip rest of frame
 
 dim spi_clock
 dim spi_broadcast_ratio
@@ -139,6 +141,8 @@ event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
 	stdma_current_slot = 0
 	stdma_braodcasting = 0
 	waiting = 0
+	
+	skip = 0
 	
 	# configure gpio ports
 	call hardware_io_port_config_direction(0, $10)	# Configure slave select as output
@@ -230,7 +234,7 @@ event system_boot(major, minor, patch, build, ll_version, protocol_version, hw)
 	# increments of 625us
 	# range: 0x4 - 0x4000
 	# with active scanning receiver will send a scan response msg
-	call gap_set_scan_parameters($28, $28, 0)						# the values selected should be a multiple of the stdma interval
+	call gap_set_scan_parameters($20, $20, 0)						# the values selected should be a multiple of the stdma interval
 	
 	call sm_set_bondable_mode(1)									 # setup bonding
   
@@ -263,6 +267,8 @@ event connection_status(connection, flags, address, address_type, conn_interval,
 		
 		spi_clock = (conn_interval*32768*5)/(1000*4)										# set spi salve speed to max connection interval units 1.25 (5/4)
 		spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+        if spi_broadcast_ratio = 0
+			spi_broadcast_ratio = 1
 
 		# stop clocks
 		call hardware_set_soft_timer(0, 0, 0)
@@ -282,19 +288,19 @@ event connection_status(connection, flags, address, address_type, conn_interval,
 		call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)
 	end if
 	
-	# check for "encrypted" status update (i.e. paired)
-    if (flags & $08) = $08 then
-        # update status
-        spi_clock = (conn_interval*32768*5)/(1000*4)										# set spi salve speed to max connection interval units 1.25 (5/4)
-		spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+	# connection updated
+    #if (flags & $08) = $08 then
+    #    # update status
+    #    spi_clock = (conn_interval*32768*5)/(1000*4)										# set spi salve speed to max connection interval units 1.25 (5/4)
+	#	spi_broadcast_ratio = STDMA_FRAME_DURATION/(spi_clock*STDMA_SLOTS) + 409/spi_clock	# 409 = 12.5ms, minimum advertise period
+	#	
+	#	# stop clocks
+	#	call hardware_set_soft_timer(0, 0, 0)
+	#	call hardware_set_soft_timer(0, 1, 0)
+	#	call hardware_set_soft_timer(0, 2, 0)
 		
-		# stop clocks
-		call hardware_set_soft_timer(0, 0, 0)
-		call hardware_set_soft_timer(0, 1, 0)
-		call hardware_set_soft_timer(0, 2, 0)
-		
-		call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)
-	end if
+	#	call hardware_set_soft_timer(spi_clock, broadcast_mode, 0)
+	#end if
 end
 
 # catch disconnection event
@@ -334,7 +340,7 @@ event gap_scan_response(rssi, packet_type, sender, address_type, bond, resp_len,
 	if memcmp (sender(3),my_mac_addr(3),3) then		# check if sender is likely a bluegiga module or dongle
 	
 		# store stdma slot, offset and timeout
-		# response data is [offset, timeout, data]
+		# response data is [header, offset, timeout, data]
 		temp = stdma_current_slot + resp_data(POS_ADV_STDMA_OFFSET:1)										# next reserved slot
 		while temp > STDMA_SLOTS														# wrap index on number of slots
 			temp = temp - STDMA_SLOTS
@@ -381,20 +387,21 @@ event hardware_soft_timer(handle)
 	end if
 	
 	if handle = 1 then
+		# stop broadcasting if I just was
+		if stdma_braodcasting = 1 then
+			call gap_set_mode(0, 0)	# stop advertisement
+			call gap_discover(gap_discover_observation)			# scan for other modules to get rssi values
+			stdma_braodcasting = 0
+		end if
+
 		spi_counter = spi_counter + 1
 		if (spi_counter - spi_broadcast_ratio*(spi_counter/spi_broadcast_ratio)) = 0 then	# modulo
 			spi_counter = 0
-			# stop broadcasting if I just was
-			if stdma_braodcasting = 1 then
-				call gap_set_mode(0, 0)	# stop advertisement
-				call gap_discover(gap_discover_observation)			# scan for other modules to get rssi values
-				stdma_braodcasting = 0
-			end if
-			
 			# increment current slot number
 			stdma_current_slot = stdma_current_slot + 1
 			if stdma_current_slot = STDMA_SLOTS then				# end of frame
 				stdma_current_slot = 0								# wrap slot counter
+				skip = 0
 				
 				# decrement timeout values
 				i = 0
@@ -449,10 +456,21 @@ event hardware_soft_timer(handle)
 				end if
 			end if
 			
-			if stdma_current_slot = stdma_my_slot
+			if stdma_current_slot = stdma_my_slot and skip = 0
 				stdma_my_slot = stdma_my_next_slot
 				# set advertisement data
-				adv_data(POS_ADV_STDMA_OFFSET:1) = stdma_my_slot - stdma_current_slot + STDMA_SLOTS		# offset to next transmission
+				adv_data(POS_ADV_STDMA_OFFSET:1) = stdma_my_slot - stdma_current_slot		# offset to next transmission
+				while adv_data(POS_ADV_STDMA_OFFSET:1) < STDMA_SLOTS + STDMA_MAX_INTERVAL - STDMA_MIN_INTERVAL
+  			  adv_data[POS_ADV_STDMA_OFFSET] = adv_data[POS_ADV_STDMA_OFFSET]  + STDMA_SLOTS
+  			end while
+			  
+		    while adv_data(POS_ADV_STDMA_OFFSET:1) > STDMA_SLOTS + STDMA_MAX_INTERVAL - STDMA_MIN_INTERVAL
+			    adv_data(POS_ADV_STDMA_OFFSET:1) = adv_data(POS_ADV_STDMA_OFFSET:1) - STDMA_SLOTS;
+  	    end while
+			  
+			if(adv_data[POS_ADV_STDMA_OFFSET] > STDMA_SLOTS)
+			  skip = 1;
+			  
 				if adv_data(POS_ADV_STDMA_OFFSET:1) > 2*STDMA_SLOTS then
 					adv_data(POS_ADV_STDMA_OFFSET:1) = adv_data(POS_ADV_STDMA_OFFSET:1)  - STDMA_SLOTS
 				end if
@@ -465,13 +483,12 @@ event hardware_soft_timer(handle)
 				# broadcast!
 				call gap_end_procedure()												# disable scan
 				# enable advertisement
+				stdma_braodcasting = 1
 				if connected then
 					call gap_set_mode(gap_user_data, gap_scannable_non_connectable)
 				else
 					call gap_set_mode(gap_user_data, gap_undirected_connectable)
 				end if
-
-				stdma_braodcasting = 1
 			end if
 		end if
 		
@@ -484,7 +501,7 @@ event hardware_soft_timer(handle)
 				spi_data(0:1) = $ff - (SPI_DATA_LEN - 3)				# encode msg length in header
 				memcpy(spi_data(3), broadcast_msg(1), SPI_DATA_LEN - 3)
 				
-				memcpy(broadcast_msg(1), broadcast_msg(SPI_DATA_LEN - 3), broadcast_msg(0:1) - (SPI_DATA_LEN - 3))
+				memcpy(broadcast_msg(1), broadcast_msg(SPI_DATA_LEN - 3 + 1), broadcast_msg(0:1) - (SPI_DATA_LEN - 3))
 				broadcast_msg(0:1) = broadcast_msg(0:1) - (SPI_DATA_LEN - 3)
 		    else
 		  	    spi_data(0:1) = $ff - broadcast_msg(0:1)				# encode msg length in header
